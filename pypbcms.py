@@ -12,6 +12,7 @@ import sys
 from twisted.internet import task, threads, protocol, defer, endpoints, reactor
 from twisted.internet.error import ProcessDone, ConnectionDone
 from twisted.python.log import startLogging
+from twisted.python.util import println
 from twisted.protocols.basic import IntNStringReceiver
 
 
@@ -27,6 +28,7 @@ LENGTH_PREFIX_LENGTH = struct.calcsize(LENGTH_PREFIX_FORMAT)
 MAX_MESSAGE_LENGTH = struct.unpack(LENGTH_PREFIX_FORMAT, "\xff" * LENGTH_PREFIX_LENGTH)[0]
 
 TEMP_DIR = os.path.join(tempfile.gettempdir(), NAME)
+
 
 
 
@@ -133,11 +135,11 @@ class ServerAndClientSharedProtocol(JsonProtocol):
     def call_action(self, name, data):
         """calls an action on the peer providing data as an argument."""
         msg = {
-            "type": self.MSF_TYPE_ACTION,
+            "type": self.MSG_TYPE_ACTION,
             "action_name": name,
             "data": data,
             }
-        self.sendString(msg)
+        self.send_message(msg)
 
     def handle_init_file_transfer(self, msg):
         """handles an incomming file transfer."""
@@ -157,6 +159,10 @@ class ServerAndClientSharedProtocol(JsonProtocol):
         self.call_action(self, "init_file_transfer", data)
         self.send_raw(content)
 
+    def send_version(self):
+        """sends the version to the server."""
+        self.call_action("version", {"version": VERSION})
+
 
 class ServerProtocol(ServerAndClientSharedProtocol):
     """The protocol for the server"""
@@ -164,9 +170,20 @@ class ServerProtocol(ServerAndClientSharedProtocol):
         ServerAndClientSharedProtocol.__init__(self)
         self.factory = factory
 
+    def connectionMade(self):
+        """called when the connection was made."""
+        self.factory.add_client(self)
+
     def connectionLost(self, reason):
         """called when the connection was lost."""
         self.factory.remove_client(self)
+
+    def handle_version(self, msg):
+        """handles the version message."""
+        v = msg.get("version", None)
+        self.send_version()
+        if v != VERSION:
+            reactor.callLater(1.0, self.disconnect)
 
 
 class ClientProtocol(ServerAndClientSharedProtocol):
@@ -187,9 +204,12 @@ class ClientProtocol(ServerAndClientSharedProtocol):
         else:
             self.d.errback(reason)
 
-    def send_version(self):
-        """sends the version to the server."""
-        self.call_action("version", {"version": VERSION})
+    def handle_version(self, msg):
+        """handles the version response from the server."""
+        v = msg.get("version", None)
+        if v != VERSION:
+            println("Error: Version mismatch! Client version: {c} Server version: {s}.".format(c=VERSION, s=v))
+            self.disconnect()
 
 
 class MessageReceiverProtocol(protocol.Protocol):
@@ -244,7 +264,6 @@ class ServerFactory(protocol.Factory):
     def buildProtocol(self, addr):
         """builds a protocol for the communication with the client and returns it."""
         p = ServerProtocol(self)
-        self.add_client(p)
         return p
 
     def add_client(self, p):
