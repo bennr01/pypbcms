@@ -258,10 +258,8 @@ class ClientProtocol(ServerAndClientSharedProtocol):
         if command is None:
             pass
         else:
-            print command
             self.set_working(False)
-            v = yield utils.getProcessOutput(command[0], command)
-            print "value: ", v
+            v = yield utils.getProcessValue(command[0], command)
             self.set_working(True)
 
     def handle_sendinfo(self, msg):
