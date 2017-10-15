@@ -327,6 +327,18 @@ class ServerProtocol(ServerAndClientSharedProtocol):
         """returns a deferred firing with a bool indicating wether the client is working or not."""
         return self.call_remote("is_working")
 
+    def set_tag(self, key, value):
+        """
+        Sets a key in the info to the specified value.
+        This can be used to 'tag' clients in order to create groups.
+        A tag can replace a normal key/value-pair in the info.
+        """
+        return self.call_remote("set_tag", key, value)
+
+    def remove_tag(self, key):
+        """removes a tag."""
+        return self.call_remote("remove_tag", key)
+
 
 class ClientProtocol(ServerAndClientSharedProtocol):
     """The protocol for the client."""
@@ -335,6 +347,7 @@ class ClientProtocol(ServerAndClientSharedProtocol):
         self.ns = ns
         self.d = d
         self.is_working = False
+        self.tags = {}
 
     def set_working(self, status=True):
         """sets the working status of the client."""
@@ -369,11 +382,21 @@ class ClientProtocol(ServerAndClientSharedProtocol):
             "release": platform.release(),
             "pid": os.getpid(),
             }
+        data.update(self.tags)
         return data
 
     def remote_is_working(self):
         """returns a boolean indicating wether the client is currently working or not."""
         return self.is_working
+
+    def remote_set_tag(self, key, value):
+        """sets a tag to the specified value."""
+        self.tags[key] = value
+
+    def remote_remove_tag(self, key):
+        """removes a tag."""
+        if key in self.tags:
+            del self.tags[key]
 
 
 class ServerFactory(protocol.Factory):
@@ -549,6 +572,7 @@ class ManagementShell(cmd.Cmd):
         return d
 
     @command_on_reactor_loop
+    @defer.inlineCallbacks
     def do_select(self, l):
         """select <ALL|NONE|condition> [-e]: sets the selected clients."""
         args = shlex.split(l)
@@ -558,15 +582,15 @@ class ManagementShell(cmd.Cmd):
             if cs == "ALL":
                 self.selected = self.factory.list_client_ids()
                 self.update_prompt()
-                return
+                defer.returnValue(None)
             elif cs == "NONE":
                 self.selected = []
                 self.update_prompt()
-                return
+                defer.returnValue(None)
         elif len(args) == 2:
             if "-e" not in args:
                 self.write("Usage Error: unknown argument.\n")
-                return
+                defer.returnValue(None)
             elif "-e" in args:
                 include_empty = True
                 args.remove("-e")
@@ -580,9 +604,11 @@ class ManagementShell(cmd.Cmd):
         except Exception as e:
             self.write("Error evaluating selection conditions:\n")
             self.write(repr(e) + "\n")
-            return
+            defer.returnValue(None)
         if isinstance(c, (int, long)):
             self.selected = [c]
+            self.update_prompt()
+            defer.returnValue(None)
         elif isinstance(c, (list, tuple)):
             self.selected = []
             for e in c:
@@ -593,7 +619,7 @@ class ManagementShell(cmd.Cmd):
             self.selected = c
             self.filter_selected()
             self.update_prompt()
-        self.selected = self.factory.search_for_clients(c, include_empty=include_empty)
+        self.selected = yield self.factory.search_for_clients(c, include_empty=include_empty)
         self.update_prompt()
 
     def do_selected(self, l):
@@ -616,6 +642,7 @@ class ManagementShell(cmd.Cmd):
         pinfo = yield p.get_info()
         self.pprint(pinfo)
 
+    @command_on_reactor_loop
     def do_disconnect(self, l):
         """disconnect: disconnects all selected clients."""
         for c in self.selected:
@@ -639,7 +666,47 @@ class ManagementShell(cmd.Cmd):
             self.write("Done. Exit codes:\n")
             self.pprint(dict(counter))
         else:
-            self.write("No clients found; no commands executed.\n")
+            self.write("Error: No clients found; no commands executed.\n")
+
+    @command_on_reactor_loop
+    @defer.inlineCallbacks
+    def do_set_tag(self, l):
+        """set_tag <name> <value>: sets a tag for the selected clients."""
+        splitted = shlex.split(l)
+        if len(splitted) != 2:
+            self.write("Usage: set_tag <name> <value>\n")
+            defer.returnValue(None)
+        key, value = splitted
+        ds = []
+        clients = self.factory.get_clients(self.selected, include_None=True)
+        for c in clients:
+            d = c.set_tag(key, value)
+            ds.append(d)
+        if len(ds) > 0:
+            yield defer.gatherResults(ds)
+            self.write("Done.\n")
+        else:
+            self.write("Error: No clients found; no tags set.\n")
+
+    @command_on_reactor_loop
+    @defer.inlineCallbacks
+    def do_remove_tag(self, l):
+        """remove_tag <name>: removes a tag from the selected clients."""
+        splitted = shlex.split(l)
+        if len(splitted) != 1:
+            self.write("Usage: remove_tag <name>\n")
+            defer.returnValue(None)
+        key = splitted[0]
+        ds = []
+        clients = self.factory.get_clients(self.selected, include_None=True)
+        for c in clients:
+            d = c.remove_tag(key)
+            ds.append(d)
+        if len(ds) > 0:
+            yield defer.gatherResults(ds)
+            self.write("Done.\n")
+        else:
+            self.write("Error: No clients found; no tags removed.\n")
         
 
 
