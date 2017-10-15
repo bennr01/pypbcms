@@ -4,7 +4,6 @@ import struct
 import json
 import tempfile
 import os
-import shutil
 import shlex
 import argparse
 import sys
@@ -12,6 +11,8 @@ import platform
 import socket
 import pprint
 import time
+import functools
+import collections
 
 try:
     import multiprocessing
@@ -21,7 +22,7 @@ except ImportError:
 from twisted.internet import task, threads, protocol, defer, endpoints, utils, reactor
 from twisted.internet.error import ProcessDone, ConnectionDone
 from twisted.python.log import startLogging
-from twisted.python.util import println
+from twisted.python.threadable import isInIOThread
 from twisted.protocols.basic import IntNStringReceiver
 
 
@@ -39,6 +40,11 @@ MAX_MESSAGE_LENGTH = struct.unpack(LENGTH_PREFIX_FORMAT, "\xff" * LENGTH_PREFIX_
 TEMP_DIR = os.path.join(tempfile.gettempdir(), NAME)
 
 
+# ================= EXCEPTIONS ======================
+
+class RPCError(Exception):
+    """An Error occured during a RPC procedure."""
+    pass
 
 
 
@@ -68,63 +74,200 @@ def is_not_None(obj):
     return (obj is not None)
 
 
+def command_on_reactor_loop(f):
+    """
+    A decorator for cmd.Cmd().do_* functions which have to be called on the main reactor loop.
+    """
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        if not isInIOThread():
+            return threads.blockingCallFromThread(reactor, f, *args, **kwargs)
+        else:
+            return f(*args, **kwargs)
+    return wrapper
+
+
 # ================= PROTOCOLS ======================
 
-class JsonProtocol(IntNStringReceiver):
+class DualRPCProtocol(IntNStringReceiver):
     """
-    A protocol for exchanging JSON messages.
-    It also contains a mechanic for setting another target for the received data.
+    A RPC protocol which allows both sides to make RPC calls.
     """
     structFormat = LENGTH_PREFIX_FORMAT
     prefixLength = LENGTH_PREFIX_LENGTH
     MAX_LENGTH = MAX_MESSAGE_LENGTH
 
-    def __init__(self):
-        self.receiver = None
+    RPC_PREFIX = "remote_"  # prefix to identify rpc functions
 
+    # constants to identify message types
+    _TYPE_VERSION_CHECK = "version_check"
+    _TYPE_VERSION_RESPONSE = "version_response"
+    _TYPE_RPC_REQUEST = "rpc_request"
+    _TYPE_RPC_RESPONSE = "rpc_response"
+
+    # constants to identify response success
+    _STATUS_OK = "OK"
+    _STATUS_ERROR = "error"
+
+    def __init__(self):
+        self._cur_id = 0
+        self._id2d = {}  # id -> Deferred()
+
+    def _get_id(self):
+        """returns a new id used to identify a rpc procedure."""
+        ret, self._cur_id = self._cur_id, self._cur_id + 1
+        return ret
+
+    def connectionMade(self):
+        """called when the connection was established."""
+        self._did_version_check = False
+        self._send_version_check()
+
+    def connectionLost(self, reason):
+        """called when the connection was lost."""
+        for cid in self._id2d:
+            d = self._id2d[cid]
+            d.errback(
+                RPCError(
+                    "The connection lost before a response was received."
+                    )
+                )
+
+    def _send_version_check(self):
+        """sends the version check message"""
+        self.send_message(
+            {
+                "type": self._TYPE_VERSION_CHECK,
+                "version": VERSION,
+                }
+            )
+
+    @defer.inlineCallbacks
     def stringReceived(self, s):
         """called when a string was received"""
-        if self.receiver is not None:
-            self.receiver.dataReceived(s)
-        else:
-            try:
-                content = json.loads(s)
-            except:
-                pass
+        try:
+            content = json.loads(s)
+        except Exception:
+            self.loseConnection()
+            defer.returnValue(None)
+        
+        mtype = content.get("type", None)
+        if mtype == self._TYPE_VERSION_CHECK:
+            ov = content.get("version", None)
+            match = (ov == VERSION)
+            self.send_message(
+                {
+                    "type": self._TYPE_VERSION_RESPONSE,
+                    "version": VERSION,
+                    "match": match,
+                    }
+                )
+            if not match:
+                self.loseConnection()
+                self._did_version_check = False  # set to false to ignore incomming messages
             else:
-                return self.messageReceived(content)
-
-    def messageReceived(self, msg):
-        """called when a json message was received."""
-        pass
-
-    def set_receiver(self, r):
-        """sets the protocol into raw mode and relay the data to the specified receiver."""
-        self.receiver = r
-
-    def remove_receiver(self):
-        """removes the receiver and sets the protocol into json mode."""
-        self.receiver = None
+                self._did_version_check = True
+            defer.returnValue(None)
+        elif mtype == self._TYPE_VERSION_RESPONSE:
+            m = content.get("match", False)
+            if not m:
+                self.loseConnection()
+                self._did_version_check = False
+            else:
+                self._did_version_check = True
+            defer.returnValue(None)
+        elif not self._did_version_check:
+            # ignore message
+            # this elif will block the execution of the following 'elif' statements.
+            defer.returnValue(None)
+        elif mtype in (self._TYPE_RPC_REQUEST, self._TYPE_RPC_RESPONSE):
+            cid = content.get("id", None)
+            if cid is None:
+                self.loseConnection()
+                defer.returnValue(None)
+            if mtype == self._TYPE_RPC_REQUEST:
+                fn = content.get("name", None)
+                args = tuple(content.get("args", ()))
+                kwargs = content.get("kwargs", {})
+                ffn = self.RPC_PREFIX + fn
+                if (fn is None) or ("." in fn):
+                    defer.returnValue(None)
+                if not hasattr(self, ffn):
+                    answer = {
+                        "type": self._TYPE_RPC_RESPONSE,
+                        "id": cid,
+                        "status": self._STATUS_ERROR,
+                        "error_message": repr(
+                            KeyError(
+                                "No such method or function: '{n}'".format(
+                                    n=fn,
+                                    )
+                                )
+                            ),
+                        }
+                    self.send_message(answer)
+                    defer.returnValue(None)
+                f = getattr(self, ffn)
+                try:
+                    res = yield f(*args, **kwargs)
+                except Exception as e:
+                    answer = {
+                        "type": self._TYPE_RPC_RESPONSE,
+                        "id": cid,
+                        "status": self._STATUS_ERROR,
+                        "error_message": repr(e),
+                        }
+                else:
+                    answer = {
+                        "type": self._TYPE_RPC_RESPONSE,
+                        "id": cid,
+                        "status": self._STATUS_OK,
+                        "result": res,
+                        }
+                self.send_message(answer)
+            elif mtype == self._TYPE_RPC_RESPONSE:
+                d = self._id2d[cid]
+                del self._id2d[cid]
+                did_error = (content.get("status", self._STATUS_ERROR) == self._STATUS_ERROR)
+                if did_error:
+                    msg = content.get("error_message", "Unknown RPC Error")
+                    error = RPCError(msg)
+                    d.errback(error)
+                else:
+                    res = content.get("result", None)
+                    d.callback(res)
+        else:
+            # protocol violation
+            self.loseConnection()
 
     def send_message(self, msg):
         """encodes the message as json and sends it to the peer."""
         s = json.dumps(msg)
         self.sendString(s)
 
-    def send_raw(self, s):
-        """sends a raw string to the peer."""
-        self.sendMessage(s)
+    def call_remote(self, fname, *args, **kwargs):
+        """
+        Calls e remote function.
+        Returns a deferred which will either fire with the result or errback with the error message.
+        """
+        cid = self._get_id()
+        d = defer.Deferred()
+        self._id2d[cid] = d
+        self.send_message(
+            {
+                "type": self._TYPE_RPC_REQUEST,
+                "id": cid,
+                "name": fname,
+                "args": args,
+                "kwargs": kwargs,
+                }
+            )
+        return d
 
 
-class ServerAndClientSharedProtocol(JsonProtocol):
+class ServerAndClientSharedProtocol(DualRPCProtocol):
     """The part of the protocol shared by both the server and the client."""
     DATA_DIR = TEMP_DIR
-
-    MSG_TYPE_ACTION = "ACTION"
-
-    def __init__(self):
-        JsonProtocol.__init__(self)
-        self.mid2plugin = {}
 
     def is_path_allowed(self, p):
         """returns True if the path p is allowed to be accessed, False otherwise."""
@@ -136,48 +279,20 @@ class ServerAndClientSharedProtocol(JsonProtocol):
         """disconnects the protocol."""
         self.transport.loseConnection()
 
-    def messageReceived(self, msg):
-        """called when a message was received."""
-        t = msg.get("type", self.MSG_TYPE_ACTION)
-        if t == self.MSG_TYPE_ACTION:
-            n = msg.get("action_name", None)
-            if (n is None) or ("." in n):
-                return
-            fn = "handle_" + n
-            if not hasattr(self, fn):
-                return
-            f = getattr(self, fn)
-            a = msg.get("data", None)
-            return f(a)
+    def remote_set_file_content(self, name, content):
+        """sets the content of the file."""
+        if os.path.isabs(name):
+            p = name
         else:
-            return None
-
-    def call_action(self, name, data):
-        """calls an action on the peer providing data as an argument."""
-        msg = {
-            "type": self.MSG_TYPE_ACTION,
-            "action_name": name,
-            "data": data,
-            }
-        self.send_message(msg)
-
-    def handle_init_file_transfer(self, msg):
-        """handles an incomming file transfer."""
-        p = os.path.join(self.DATA_DIR, msg.get("dest", "unnamed_file"))
-        l = msg.get("length", None)
+            p = os.path.join(self.DATA_DIR, name)
         if not self.is_path_allowed(p):
-            self.disconnect()
-        if (l is None) or (not isinstance(l, (int, long))):
-            self.disconnect()
-        mrp = MessageReceiverProtocol(self, p, l)
-        mrp.start()
+            raise IOError("Path not allowed!")
+        with open(p, "wb") as fout:
+            fout.write(content)
 
     def send_file(self, name, content):
         """sends a file to the peer."""
-        l = len(content)
-        data = {"dest": name, "length": l}
-        self.call_action(self, "init_file_transfer", data)
-        self.send_raw(content)
+        self.call_remote("set_file_content", name, content)
 
     def send_version(self):
         """sends the version to the server."""
@@ -189,7 +304,6 @@ class ServerProtocol(ServerAndClientSharedProtocol):
     def __init__(self, factory, cid):
         ServerAndClientSharedProtocol.__init__(self)
         self.factory = factory
-        self.info = {}
         self.cid = cid
         self.working = False
 
@@ -201,26 +315,17 @@ class ServerProtocol(ServerAndClientSharedProtocol):
         """called when the connection was lost."""
         self.factory.remove_client(self)
 
-    def handle_version(self, msg):
-        """handles the version message."""
-        v = msg.get("version", None)
-        self.send_version()
-        if v != VERSION:
-            reactor.callLater(1.0, self.disconnect)
-
-    def handle_set_info(self, info):
-        """sets the local system info to the received system info."""
-        self.info = info
-
-    def handle_set_ready(self, msg):
-        """sets the ready state."""
-        ns = msg.get("working", False)
-        self.working = ns
-        self.info["working"] = self.working
-
     def run_command(self, command):
         """runs the command on the client."""
-        self.call_action("shell", {"command": command})
+        return self.call_remote("shell", command=command)
+
+    def get_info(self):
+        """returns client information."""
+        return self.call_remote("get_info")
+
+    def is_working(self):
+        """returns a deferred firing with a bool indicating wether the client is working or not."""
+        return self.call_remote("is_working")
 
 
 class ClientProtocol(ServerAndClientSharedProtocol):
@@ -229,46 +334,30 @@ class ClientProtocol(ServerAndClientSharedProtocol):
         ServerAndClientSharedProtocol.__init__(self)
         self.ns = ns
         self.d = d
+        self.is_working = False
 
-    def connectionMade(self):
-        """called when the connection was established."""
-        self.send_version()
+    def set_working(self, status=True):
+        """sets the working status of the client."""
+        self.is_working = status
 
     def connectionLost(self, reason):
         """called when the connection was lost."""
+        ServerAndClientSharedProtocol.connectionLost(self, reason)
         if isinstance(reason.value, ConnectionDone):
             self.d.callback(None)
         else:
             self.d.errback(reason)
 
-    def handle_version(self, msg):
-        """handles the version response from the server."""
-        v = msg.get("version", None)
-        if v != VERSION:
-            println("Error: Version mismatch! Client version: {c} Server version: {s}.".format(c=VERSION, s=v))
-            self.disconnect()
-        else:
-            self.send_info()
-            self.set_working(False)
-
     @defer.inlineCallbacks
-    def handle_shell(self, msg):
-        """handles a shell command."""
-        command = msg.get("command", None)
-        if command is None:
-            pass
-        else:
-            self.set_working(False)
-            v = yield utils.getProcessValue(command[0], command)
-            self.set_working(True)
+    def remote_shell(self, command):
+        """executes a shell command."""
+        self.set_working(True)
+        v = yield utils.getProcessValue(command[0], command[1:])
+        self.set_working(False)
+        defer.returnValue(v)
 
-    def handle_sendinfo(self, msg):
-        """sends our system information *again*."""
-        self.send_info()
-        self.set_working()
-
-    def send_info(self):
-        """sends platform information to the server."""
+    def remote_get_info(self):
+        """returns platform information of the client."""
         data = {
             "hostname": socket.gethostname(),
             "machine": platform.machine(),
@@ -280,54 +369,11 @@ class ClientProtocol(ServerAndClientSharedProtocol):
             "release": platform.release(),
             "pid": os.getpid(),
             }
-        self.call_action("set_info", data)
+        return data
 
-    def set_working(self, state):
-        """tells the server that this client is (not) working."""
-        self.call_action("set_working", {"working": state})
-
-
-class MessageReceiverProtocol(protocol.Protocol):
-    """A protocol for receiving a file."""
-    def __init__(self, master, path, length):
-        self.master = master
-        self.path = path
-        self.length = length
-        self.received = 0
-        self.f = None
-        self.started = False
-
-    def start(self):
-        """starts receiving the data and writes it to the file."""
-        if self.started:
-            raise RuntimeError("{s} already started!".format(s=self))
-        if os.path.exists(self.path):
-            if os.path.isdir(self.path):
-                shutil.rmtree(self.path)
-            else:
-                os.remove(self.path)
-        self.f = open(self.path, "wb")
-        self.received = 0
-        self.started = True
-        self.master.set_receiver(self)
-
-    def stop(self):
-        """stops receiving data, closes the file and removes the protocol."""
-        self.started = False
-        self.master.remove_receiver()
-        if self.f is not None:
-            self.f.close()
-
-    def dataReceived(self, s):
-        """called when some data was received."""
-        if not self.started:
-            raise RuntimeError("{s} not started but already receiving data!".format(s=self))
-        self.f.write(s)
-        l = len(s)
-        self.received += l
-        if (self.length - l) <= 0:
-            self.stop()
-
+    def remote_is_working(self):
+        """returns a boolean indicating wether the client is currently working or not."""
+        return self.is_working
 
 
 class ServerFactory(protocol.Factory):
@@ -371,11 +417,19 @@ class ServerFactory(protocol.Factory):
             ret.append(p)
         return ret
 
+    @defer.inlineCallbacks
     def get_working_client_ids(self):
-        """returns a list containing the client ids of all the working clients."""
-        t = filter(is_not_None, [e if self.get_client(e).working else None for e in self.list_client_ids()])
-        return t
+        """returns a defered firing with a list containing the client ids of all working clients."""
+        ret = []
+        cids = self.list_client_ids()
+        for cid in cids:
+            p = self.get_client(cid)
+            working = yield p.is_working()
+            if working:
+                ret.append(cid)
+        defer.returnValue(ret)
 
+    @defer.inlineCallbacks
     def search_for_clients(self, conditions, include_empty=False):
         """
         Returns a list of all client ids of the clients matching the conditions.
@@ -390,25 +444,26 @@ class ServerFactory(protocol.Factory):
             p = self.get_client(cid)
             if p is None:
                 continue
-            if p.info == {}:
-                if (p.info == conditions) or include_empty:
+            pinfo = yield p.get_info()
+            if pinfo == {}:
+                if (pinfo == conditions) or include_empty:
                     matches.append(cid)
                 else:
                     continue
             else:
                 dm = True
                 for k in conditions:
-                    if not k in p.info:
+                    if not k in pinfo:
                         dm = False
                         break
                     v1 = conditions[k]
-                    v2 = p.info[k]
+                    v2 = pinfo[k]
                     if v1 != v2:
                         dm = False
                         break
                 if dm:
                     matches.append(cid)
-        return matches
+        defer.returnValue(matches)
 
 
 
@@ -420,10 +475,10 @@ class ManagementShell(cmd.Cmd):
 
     def __init__(self, factory):
         cmd.Cmd.__init__(self)
-        # self.prompt = "({n})".format(n=NAME)
         self.factory = factory
         self.selected = []
-        self.update_prompt()
+        self.prompt = "(0 selected)"
+        # self.update_prompt()
 
     def write(self, msg):
         """writes a message."""
@@ -443,10 +498,13 @@ class ManagementShell(cmd.Cmd):
         # 2. remove all disconnected/non-existent clients
         self.selected = filter(is_not_None, [e if (self.factory.get_client(e) is not None) else None for e in self.selected])
 
-    def update_prompt(self):
+    @command_on_reactor_loop
+    @defer.inlineCallbacks
+    def update_prompt(self, ig=None):
         """updates the prompt."""
         n_selected = len(self.selected)
-        n_working = len(self.factory.get_working_client_ids())
+        wcids = yield self.factory.get_working_client_ids()
+        n_working = len(wcids)
         if n_working > 0:
             ws = "|{n} working".format(n=n_working)
         else:
@@ -490,6 +548,7 @@ class ManagementShell(cmd.Cmd):
             )
         return d
 
+    @command_on_reactor_loop
     def do_select(self, l):
         """select <ALL|NONE|condition> [-e]: sets the selected clients."""
         args = shlex.split(l)
@@ -541,17 +600,21 @@ class ManagementShell(cmd.Cmd):
         """selected: prints the selected ids."""
         self.pprint(self.selected)
 
+    @command_on_reactor_loop
+    @defer.inlineCallbacks
     def do_show(self, l):
         """show <cid>: shows the client info."""
         try:
             c = int(l)
         except ValueError:
             self.write("Error: Invalid argument!\n")
-            return
+            defer.returnValue(None)
         p = self.factory.get_client(c)
-        if c is None:
-            self.write("Error: No such client!\n")
-        self.pprint(p.info)
+        if p is None:
+            self.write("Error: No such client: '{c}'!\n".format(c=c))
+            defer.returnValue(None)
+        pinfo = yield p.get_info()
+        self.pprint(pinfo)
 
     def do_disconnect(self, l):
         """disconnect: disconnects all selected clients."""
@@ -560,12 +623,24 @@ class ManagementShell(cmd.Cmd):
             p.disconnect()
         time.sleep(0.5)
 
+    @command_on_reactor_loop
+    @defer.inlineCallbacks
     def do_remotecommand(self, l):
         """remotecommand [cmd]: executes cmd on the remote servers."""
         rc = shlex.split(l)
+        ds = []
         clients = self.factory.get_clients(self.selected, include_None=False)
         for c in clients:
-            c.run_command(rc)
+            d = c.run_command(rc)
+            ds.append(d)
+        if len(ds) > 0:
+            codes = yield defer.gatherResults(ds)
+            counter = collections.Counter(codes)
+            self.write("Done. Exit codes:\n")
+            self.pprint(dict(counter))
+        else:
+            self.write("No clients found; no commands executed.\n")
+        
 
 
 
