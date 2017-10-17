@@ -13,6 +13,10 @@ import pprint
 import time
 import functools
 import collections
+import shutil
+import zipfile
+import uuid
+import base64
 
 try:
     import multiprocessing
@@ -37,7 +41,9 @@ LENGTH_PREFIX_FORMAT = "!Q"
 LENGTH_PREFIX_LENGTH = struct.calcsize(LENGTH_PREFIX_FORMAT)
 MAX_MESSAGE_LENGTH = struct.unpack(LENGTH_PREFIX_FORMAT, "\xff" * LENGTH_PREFIX_LENGTH)[0]
 
-TEMP_DIR = os.path.join(tempfile.gettempdir(), NAME)
+TEMP_DIR = os.path.join(tempfile.gettempdir(), NAME)  # path of the temporary directory
+# HOME_DATA_DIR = os.path.join(os.path.expanduser("~"), NAME)
+
 
 
 # ================= EXCEPTIONS ======================
@@ -85,6 +91,66 @@ def command_on_reactor_loop(f):
         else:
             return f(*args, **kwargs)
     return wrapper
+
+
+def chunked(data, chunksize):
+    """
+    Returns a list of chunks containing at most ``chunksize`` elements of data.
+    """
+    if chunksize < 1:
+        raise ValueError("Chunksize must be at least 1!")
+    if int(chunksize) != chunksize:
+        raise ValueError("Chunksize needs to be an integer")
+    cur = []
+    for e in data:
+        cur.append(e)
+        if len(cur) >= chunksize:
+            yield cur
+            cur = []
+    if cur:
+        yield cur
+
+def delete_dir_content(p):
+    """deletes the content of the directory"""
+    for fn in os.listdir(p):
+        fp = os.path.join(p, fn)
+        if os.path.isdir(fp):
+            shutil.rmtree(fp)
+        else:
+            os.remove(fp)
+
+
+def zip_dir(p, outp):
+    """writes a directory recusrively into a zipfile"""
+    with zipfile.ZipFile(outp, mode="w", allowZip64=True) as zf:
+        _write_to_zip(p, "", zf)
+        zf.close()
+        return
+
+
+def _write_to_zip(p, fn, zf):
+    """writes p to zipfile zf."""
+    if os.path.isfile(p):
+        zf.write(p, fn)
+    else:
+        for sfn in os.listdir(p):
+            fp = os.path.join(p, sfn)
+            san = os.path.join(fn, sfn)
+            _write_to_zip(fp, san, zf)
+
+def random_filename():
+    """returns a random filename."""
+    return uuid.uuid1().hex
+
+
+def filechunks(f, n=8192):
+    """returns a iterator which yields the file content in chunks of n bytes."""
+    r = True
+    while r:
+        data = f.read(n)
+        if not data:
+            r = False
+        yield data
 
 
 # ================= PROTOCOLS ======================
@@ -268,12 +334,30 @@ class DualRPCProtocol(IntNStringReceiver):
 class ServerAndClientSharedProtocol(DualRPCProtocol):
     """The part of the protocol shared by both the server and the client."""
     DATA_DIR = TEMP_DIR
+    WORK_DIR = os.path.join(DATA_DIR, "workspace")  # path of temporary CWD
+    SYNC_DIR = os.path.join(DATA_DIR, "sync")  # path of the directory where files for the syncinc are kept.
+    MAX_SINGLE_TRANSFER = 2 ** 15
+
+    def make_temp_dirs(self):
+        """create the tempdirs if they do not exists yet."""
+        paths = [self.DATA_DIR, self.WORK_DIR, self.SYNC_DIR]
+        for p in paths:
+            if not os.path.exists(p):
+                os.makedirs(p)
 
     def is_path_allowed(self, p):
         """returns True if the path p is allowed to be accessed, False otherwise."""
         lap = os.path.abspath(self.DATA_DIR)
         ap = os.path.abspath(os.path.join(lap, p))
         return ap.startswith(lap)
+
+    def _encode(self, data):
+        """encodes data to be serializeable using json."""
+        return base64.b64encode(data)
+
+    def _decode(self, data):
+        """decodes data encoded with _encode()"""
+        return base64.b64decode(data)
 
     def disconnect(self):
         """disconnects the protocol."""
@@ -287,16 +371,55 @@ class ServerAndClientSharedProtocol(DualRPCProtocol):
             p = os.path.join(self.DATA_DIR, name)
         if not self.is_path_allowed(p):
             raise IOError("Path not allowed!")
+        content = self._decode(content)
         with open(p, "wb") as fout:
             fout.write(content)
 
+    def remote_add_to_file(self, name, content):
+        """appends content to the specified file."""
+        if os.path.isabs(name):
+            p = name
+        else:
+            p = os.path.join(self.DATA_DIR, name)
+        if not self.is_path_allowed(p):
+            raise IOError("Path not allowed!")
+        content = self._decode(content)
+        with open(p, "ab") as fout:
+            fout.write(content)
+
+    @defer.inlineCallbacks
     def send_file(self, name, content):
         """sends a file to the peer."""
-        self.call_remote("set_file_content", name, content)
+        # TODO: clean up the followinf if-statement
+        if ((isinstance(content, str) and len(content) > self.MAX_SINGLE_TRANSFER) or (not isinstance(content, str))):
+            if isinstance(content, str):
+                iterator = chunked(content, self.MAX_SINGLE_TRANSFER)
+            else:
+                iterator = content
+            n = 0
+            for c in iterator:
+                c = self._encode(c)
+                n += 1
+                if n == 1:
+                    yield self.call_remote("set_file_content", name, c)
+                else:
+                    yield self.call_remote("add_to_file", name, c)
+        else:
+            yield self.call_remote("set_file_content", name, content)
 
     def send_version(self):
         """sends the version to the server."""
         self.call_action("version", {"version": VERSION})
+
+    def remote_get_paths(self):
+        """returns a dict containing the temp dir specifications of this client."""
+        p = {
+            "data": self.DATA_DIR,
+            "sync": self.SYNC_DIR,
+            "work": self.WORK_DIR,
+            "cwd": os.getcwd(),
+            }
+        return p
 
 
 class ServerProtocol(ServerAndClientSharedProtocol):
@@ -315,9 +438,12 @@ class ServerProtocol(ServerAndClientSharedProtocol):
         """called when the connection was lost."""
         self.factory.remove_client(self)
 
-    def run_command(self, command):
-        """runs the command on the client."""
-        return self.call_remote("shell", command=command)
+    def run_command(self, command, per_core=False):
+        """
+        Runs the command on the client.
+        If 'per_core' is nonzero, run the command once per core.
+        """
+        return self.call_remote("shell", command=command, per_core=per_core)
 
     def get_info(self):
         """returns client information."""
@@ -339,6 +465,58 @@ class ServerProtocol(ServerAndClientSharedProtocol):
         """removes a tag."""
         return self.call_remote("remove_tag", key)
 
+    def clear_data_dir(self):
+        """clears the data directory of the client."""
+        return self.call_remote("clear_data_dir")
+
+    def cd(self, fn):
+        """changes the CWD of the client."""
+        return self.call_remote("cd", fn)
+
+    def cd_work_dir(self):
+        """changes the CWD of the client to the data dir."""
+        return self.call_remote("cd", None)
+
+    def get_cwd(self):
+        """returns the CWD of the client."""
+        return self.call_remote("getcwd")
+
+    def get_paths(self):
+        """returns a dict containing the temporary paths of the client."""
+        return self.call_remote("get_paths")
+
+    @defer.inlineCallbacks
+    def send_dir(self, inp, outp):
+        """sends the directory inp to outp on the client."""
+        paths = yield self.get_paths()
+        osp = paths["sync"]
+        tzp = os.path.join(self.SYNC_DIR, random_filename())
+        top = os.path.join(osp, random_filename())
+        zip_dir(inp, tzp)
+        with open(tzp, "rb") as f:
+            iterator = filechunks(f, n=self.MAX_SINGLE_TRANSFER)
+            yield self.send_file(top, iterator)
+        yield self.unzip(top, outp)
+
+    def unzip(self, inp, outp):
+        """unzips inp into outp."""
+        return self.call_remote("unzip", inp, outp)
+
+    @defer.inlineCallbacks
+    def deploy(self, inp, command, per_core=False):
+        """
+        Sends a directory to the client and runs a command.
+        If 'per_core' is nonzero, 'command' is executed once per core.
+        """
+        paths = yield self.get_paths()
+        workpath = paths["work"]
+        cwd = paths["cwd"]
+        yield self.send_dir(inp, workpath)
+        yield self.cd_work_dir()
+        ret = yield self.run_command(command, per_core=per_core)
+        yield self.cd(cwd)
+        defer.returnValue(ret)
+
 
 class ClientProtocol(ServerAndClientSharedProtocol):
     """The protocol for the client."""
@@ -348,6 +526,7 @@ class ClientProtocol(ServerAndClientSharedProtocol):
         self.d = d
         self.is_working = False
         self.tags = {}
+        self.make_temp_dirs()
 
     def set_working(self, status=True):
         """sets the working status of the client."""
@@ -362,12 +541,24 @@ class ClientProtocol(ServerAndClientSharedProtocol):
             self.d.errback(reason)
 
     @defer.inlineCallbacks
-    def remote_shell(self, command):
+    def remote_shell(self, command, per_core=False):
         """executes a shell command."""
         self.set_working(True)
-        v = yield utils.getProcessValue(command[0], command[1:])
+        self.make_temp_dirs()
+        if per_core:
+            if multiprocessing is not None:
+                n = multiprocessing.cpu_count()
+            else:
+                n = 1
+        else:
+            n = 1
+        ds = []
+        for i in xrange(n):
+            d = utils.getProcessValue(command[0], command[1:])
+            ds.append(d)
+        ret = yield defer.gatherResults(ds)
         self.set_working(False)
-        defer.returnValue(v)
+        defer.returnValue(ret)
 
     def remote_get_info(self):
         """returns platform information of the client."""
@@ -381,7 +572,10 @@ class ClientProtocol(ServerAndClientSharedProtocol):
             "system": platform.system(),
             "release": platform.release(),
             "pid": os.getpid(),
+            "cwd": os.getcwd(),
             }
+        if multiprocessing is not None:
+            data["cores"] = multiprocessing.cpu_count()
         data.update(self.tags)
         return data
 
@@ -397,6 +591,29 @@ class ClientProtocol(ServerAndClientSharedProtocol):
         """removes a tag."""
         if key in self.tags:
             del self.tags[key]
+
+    def remote_clear_data_dir(self):
+        """clears the data dir."""
+        delete_dir_content(self.DATA_DIR)
+        self.make_temp_dirs()
+
+    def remote_cd(self, fn=None):
+        """sets the working directory."""
+        self.make_temp_dirs()
+        if fn is None:
+            fn = self.WORK_DIR
+        os.chdir(fn)
+
+    def remote_getcwd(self):
+        """returns the currently working directory."""
+        self.make_temp_dirs()
+        return os.getcwd()
+
+    def remote_unzip(self, inp, outp):
+        """unzips inp into outp."""
+        self.make_temp_dirs()
+        with zipfile.ZipFile(inp, mode="r", allowZip64=True) as zf:
+            zf.extractall(outp)
 
 
 class ServerFactory(protocol.Factory):
@@ -501,7 +718,6 @@ class ManagementShell(cmd.Cmd):
         self.factory = factory
         self.selected = []
         self.prompt = "(0 selected)"
-        # self.update_prompt()
 
     def write(self, msg):
         """writes a message."""
@@ -652,21 +868,29 @@ class ManagementShell(cmd.Cmd):
 
     @command_on_reactor_loop
     @defer.inlineCallbacks
-    def do_remotecommand(self, l):
+    def do_remotecommand(self, l, per_core=False):
         """remotecommand [cmd]: executes cmd on the remote servers."""
         rc = shlex.split(l)
         ds = []
         clients = self.factory.get_clients(self.selected, include_None=False)
         for c in clients:
-            d = c.run_command(rc)
+            d = c.run_command(rc, per_core=per_core)
             ds.append(d)
         if len(ds) > 0:
-            codes = yield defer.gatherResults(ds)
+            codelists = yield defer.gatherResults(ds)
+            codes = []
+            for codelist in codelists:
+                codes += codelist
             counter = collections.Counter(codes)
             self.write("Done. Exit codes:\n")
             self.pprint(dict(counter))
         else:
             self.write("Error: No clients found; no commands executed.\n")
+
+    do_run = do_remotecommand
+    def do_run_per_core(self, l):
+        """run_per_core [cmd]: executes cmd on the remote servers n times in parallel, where n is the number of cpu cores of the client."""
+        return self.do_run(l, per_core=True)
 
     @command_on_reactor_loop
     @defer.inlineCallbacks
@@ -707,7 +931,82 @@ class ManagementShell(cmd.Cmd):
             self.write("Done.\n")
         else:
             self.write("Error: No clients found; no tags removed.\n")
-        
+
+    @command_on_reactor_loop
+    @defer.inlineCallbacks
+    def do_cd(self, l):
+        """cd [path]: changes the CWD of the selected clients. If 'path' is omitted, change into the DATA_DIR of the client."""
+        if len(l) == 0:
+            p = None
+        else:
+            p = l
+        clients = self.factory.get_clients(self.selected, include_None=False)
+        for c in clients:
+            yield c.cd(p)
+
+    @command_on_reactor_loop
+    @defer.inlineCallbacks
+    def do_cwd(self, l):
+        """cwd: print the CWD."""
+        ds = []
+        clients = self.factory.get_clients(self.selected, include_None=False)
+        for c in clients:
+            d = c.get_cwd()
+            ds.append(d)
+        if len(ds) > 0:
+            codes = yield defer.gatherResults(ds)
+            counter = collections.Counter(codes)
+            self.write("Done. CWDs:\n")
+            self.pprint(dict(counter))
+        else:
+            self.write("Error: No clients found.\n")
+
+    do_pwd = do_getcwd = do_cwd
+
+    @command_on_reactor_loop
+    @defer.inlineCallbacks
+    def do_clear_data(self, l):
+        """clear_data: removes all temporary files on the selected clients."""
+        ds = []
+        clients = self.factory.get_clients(self.selected, include_None=False)
+        for c in clients:
+            d = c.clear_data_dir()
+            ds.append(d)
+        if len(ds) > 0:
+            yield defer.gatherResults(ds)
+            self.write("Done\n")
+        else:
+            self.write("Error: No clients found.\n")
+
+    @command_on_reactor_loop
+    @defer.inlineCallbacks
+    def do_deploy(self, l, per_core=False):
+        """deploy <dir> <command> [args [args...]]: send dir to selected clients and run command in the directory on the client."""
+        rc = shlex.split(l)
+        if len(rc) < 2:
+            self.write("Error: expected at least two arguments!\n")
+            defer.returnValue(None)
+        p = rc[0]
+        command = rc[1:]
+        ds = []
+        clients = self.factory.get_clients(self.selected, include_None=False)
+        for c in clients:
+            d = c.deploy(p, command, per_core=per_core)
+            ds.append(d)
+        if len(ds) > 0:
+            codelists = yield defer.gatherResults(ds)
+            codes = []
+            for codelist in codelists:
+                codes += codelist
+            counter = collections.Counter(codes)
+            self.write("Done. Exit codes:\n")
+            self.pprint(dict(counter))
+        else:
+            self.write("Error: No clients found; no commands executed.\n")
+
+    def do_deploy_per_core(self, l):
+        """deploy <dir> <command> [args [args...]]: send dir to selected clients and run command n times parallel in the directory on the client, where n is the number of cpu_cores of the client."""
+        return self.do_deploy(l, per_core=True)
 
 
 
@@ -741,6 +1040,9 @@ def main():
     The main function.
     We start the server and a shell in a thread and wait for its completion.
     """
+    if not os.path.exists(TEMP_DIR):
+        os.mkdir(TEMP_DIR)
+
     parser = argparse.ArgumentParser(description="A python plugin-based cluster management system")
     parser.add_argument("action", action="store", choices=["server", "client"], help="what to do")
     parser.add_argument("-v", "--verbose", action="store_true", help="print additional information")
