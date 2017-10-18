@@ -28,7 +28,7 @@ from twisted.internet.error import ProcessDone, ConnectionDone
 from twisted.python.log import startLogging
 from twisted.python.threadable import isInIOThread
 from twisted.protocols.basic import IntNStringReceiver
-
+from twisted.application.internet import ClientService
 
 # ================= CONSTANTS ======================
 
@@ -195,7 +195,7 @@ class DualRPCProtocol(IntNStringReceiver):
             d = self._id2d[cid]
             d.errback(
                 RPCError(
-                    "The connection lost before a response was received."
+                    "The connection was lost before a response was received."
                     )
                 )
 
@@ -437,6 +437,7 @@ class ServerProtocol(ServerAndClientSharedProtocol):
     def connectionLost(self, reason):
         """called when the connection was lost."""
         self.factory.remove_client(self)
+        ServerAndClientSharedProtocol.connectionLost(self, reason)
 
     def run_command(self, command, per_core=False):
         """
@@ -517,14 +518,21 @@ class ServerProtocol(ServerAndClientSharedProtocol):
         yield self.cd(cwd)
         defer.returnValue(ret)
 
+    def stop(self):
+        """stops the client."""
+        self.factory.remove_client(self)
+        return self.call_remote("stop")
+
 
 class ClientProtocol(ServerAndClientSharedProtocol):
     """The protocol for the client."""
-    def __init__(self, ns, d):
+    def __init__(self, factory, ns, d):
         ServerAndClientSharedProtocol.__init__(self)
+        self.factory = factory
         self.ns = ns
         self.d = d
         self.is_working = False
+        self.stopped = False
         self.tags = {}
         self.make_temp_dirs()
 
@@ -532,13 +540,20 @@ class ClientProtocol(ServerAndClientSharedProtocol):
         """sets the working status of the client."""
         self.is_working = status
 
+    def connectionMade(self):
+        """called when the connection was made."""
+        ServerAndClientSharedProtocol.connectionMade(self)
+        self.set_working(False)
+        self.make_temp_dirs()
+
     def connectionLost(self, reason):
         """called when the connection was lost."""
         ServerAndClientSharedProtocol.connectionLost(self, reason)
-        if isinstance(reason.value, ConnectionDone):
-            self.d.callback(None)
-        else:
-            self.d.errback(reason)
+        if (not self.ns.reconnect) and (not self.stopped):
+            if isinstance(reason.value, ConnectionDone):
+                self.d.callback(None)
+            else:
+                self.d.errback(reason)
 
     @defer.inlineCallbacks
     def remote_shell(self, command, per_core=False):
@@ -615,6 +630,13 @@ class ClientProtocol(ServerAndClientSharedProtocol):
         with zipfile.ZipFile(inp, mode="r", allowZip64=True) as zf:
             zf.extractall(outp)
 
+    def remote_stop(self):
+        """stops this client"""
+        self.factory.stop()
+        self.disconnect()
+        self.stopped = True
+        self.d.callback(None)
+
 
 class ServerFactory(protocol.Factory):
     """The protocol factory for the server."""
@@ -631,13 +653,12 @@ class ServerFactory(protocol.Factory):
 
     def add_client(self, p):
         """adds a client to the internal client list."""
-        peer = p.cid
-        self.clients[peer] = p
+        self.clients[p.cid] = p
 
     def remove_client(self, p):
         """removes a client from the internal client list."""
-        peer = p.cid
-        del self.clients[peer]
+        if p.cid in self.clients:
+            del self.clients[p.cid]
 
     def list_client_ids(self):
         """returns a list containting the client ids of all currently connected clients."""
@@ -705,6 +726,26 @@ class ServerFactory(protocol.Factory):
                     matches.append(cid)
         defer.returnValue(matches)
 
+
+class ClientFactory(protocol.Factory):
+    """the factory for the client."""
+    protocol = ClientProtocol
+
+    def __init__(self, ns, d, service=None):
+        self.ns = ns
+        self.d = d
+        self.service = service
+        self.noisy = ns.verbose
+
+    def buildProtocol(self, addr):
+        """builds the protocol."""
+        p = self.protocol(self, self.ns, self.d)
+        return p
+
+    def stop(self):
+        """stops the factory"""
+        if self.service is not None:
+            self.service.stopService()
 
 
 # ================= SHELL ======================
@@ -782,7 +823,6 @@ class ManagementShell(cmd.Cmd):
             p,
             splitted[0],
             splitted,
-            # usePTY=True,
             childFDs={0:0, 1:1, 2:2},
             )
         return d
@@ -864,7 +904,14 @@ class ManagementShell(cmd.Cmd):
         for c in self.selected:
             p = self.factory.get_client(c)
             p.disconnect()
-        time.sleep(0.5)
+
+    @command_on_reactor_loop
+    def do_stop(self, l):
+        """stop: stops all selected clients."""
+        for c in self.selected:
+            p = self.factory.get_client(c)
+            d = p.stop()
+            d.addBoth(lambda r: None)
 
     @command_on_reactor_loop
     @defer.inlineCallbacks
@@ -1028,10 +1075,14 @@ def start_shell(reactor, ns):
 def start_client(reactor, ns):
     """starts the client and connects to the server."""
     d = defer.Deferred()
-    p = ClientProtocol(ns, d)
+    factory = ClientFactory(ns, d)
     ep = endpoints.TCP4ClientEndpoint(reactor, host=ns.host, port=ns.port)
-    cpd = endpoints.connectProtocol(ep, p)
-    cpd.addErrback(d.errback)
+    cs = ClientService(ep, factory, retryPolicy=lambda f: 3)
+    factory.service = cs
+    if not ns.reconnect:
+        wfc = cs.whenConnected(failAfterFailures=1)
+        wfc.addErrback(d.errback)
+    cs.startService()
     return d
 
 
@@ -1048,6 +1099,7 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true", help="print additional information")
     parser.add_argument("-H", "--host", action="store", help="host/interface to connect/bind to", default="0.0.0.0")
     parser.add_argument("-p", "--port", action="store", type=int, default=DEFAULT_PORT, help="port of the server")
+    parser.add_argument("-r", "--reconnect", action="store_true", dest="reconnect", help="auto reconnect to server")
     parser.add_argument("--noshell", action="store_false", dest="shell", help="do not start a shell when starting the server")
     ns = parser.parse_args()
     if ns.verbose:
