@@ -10,13 +10,13 @@ import sys
 import platform
 import socket
 import pprint
-import time
 import functools
 import collections
 import shutil
 import zipfile
 import uuid
 import base64
+import imp
 
 try:
     import multiprocessing
@@ -30,6 +30,9 @@ from twisted.python.threadable import isInIOThread
 from twisted.protocols.basic import IntNStringReceiver
 from twisted.application.internet import ClientService
 
+from zope.interface import Interface, Attribute
+
+
 # ================= CONSTANTS ======================
 
 NAME = "pypbcms"
@@ -42,7 +45,14 @@ LENGTH_PREFIX_LENGTH = struct.calcsize(LENGTH_PREFIX_FORMAT)
 MAX_MESSAGE_LENGTH = struct.unpack(LENGTH_PREFIX_FORMAT, "\xff" * LENGTH_PREFIX_LENGTH)[0]
 
 TEMP_DIR = os.path.join(tempfile.gettempdir(), NAME)  # path of the temporary directory
-# HOME_DATA_DIR = os.path.join(os.path.expanduser("~"), NAME)
+HOME_DATA_DIR = os.path.join(os.path.expanduser("~"), NAME)
+HOME_PLUGIN_DIR = os.path.join(HOME_DATA_DIR, "plugins")
+DATA_DIR = TEMP_DIR
+WORK_DIR = os.path.join(DATA_DIR, "workspace")  # path of temporary CWD
+SYNC_DIR = os.path.join(DATA_DIR, "sync")  # path of the directory where files for the syncinc are kept.
+PLUGIN_DIR = os.path.join(TEMP_DIR, "plugins")
+PATHS = [TEMP_DIR, HOME_DATA_DIR, HOME_PLUGIN_DIR, DATA_DIR, WORK_DIR, SYNC_DIR, PLUGIN_DIR]
+PLUGIN_PATHS = [PLUGIN_DIR, HOME_PLUGIN_DIR]
 
 
 
@@ -52,6 +62,10 @@ class RPCError(Exception):
     """An Error occured during a RPC procedure."""
     pass
 
+
+class PluginNotFoundError(Exception):
+    """The specified plugin was not found."""
+    pass
 
 
 # ================= UTILITIES ======================
@@ -151,6 +165,181 @@ def filechunks(f, n=8192):
         if not data:
             r = False
         yield data
+
+
+def load_plugins(interface):
+    """loads the plugins for 'interface' and returns them."""
+    make_global_dirs()
+    plugins = []
+    plugin_identifiers = []
+    # iterate over all plugin install directories
+    for pp in PLUGIN_PATHS:
+        # iterate over the files and directories inside the plugin directory
+        content = os.listdir(pp)
+        for fn in content:
+            fp = os.path.join(pp, fn)
+            if os.path.isfile(fp) and fn.endswith(".py"):
+                # load module
+                modname = os.path.splitext(fn)[0]
+                mod = imp.load_source(modname, fp)
+                # find implementations of interface
+                for obj_name in dir(mod):
+                    obj = getattr(mod, obj_name, None)
+                    if interface.providedBy(obj):
+                        # prevent duplicate insertions
+                        pid = "{f}.{c}".format(f=fn, c=obj_name)
+                        if pid not in plugin_identifiers:  # obj not in plugins wont work if the same plugin is installed multiple times
+                            plugins.append(obj)
+                            plugin_identifiers.append(pid)
+                    
+    return plugins
+
+
+def make_global_dirs():
+    """creates the global directoriesif they do not exist."""
+    for p in PATHS:
+        if not os.path.exists(p):
+            os.makedirs(p)
+
+
+# ================= INTERFACES ======================
+
+
+class ICommand(Interface):
+    """A shell command."""
+
+    command = Attribute("""
+    @type command: C{str} or C{unicode}
+    @ivar command: the string to identify the command
+    """)
+
+    def on_load(factory, shell):
+        """
+        Called after the plugin was loaded.
+
+        @type factory: C{ServerFactory}
+        @param factory: the server factory
+
+        @type shell: C{ManagementShell}
+        @param shell: the command shell
+        """
+        pass
+
+    def on_unload(factory, shell):
+        """
+        Called before the plugin will be unloaded.
+
+        @type factory: C{ServerFactory}
+        @param factory: the server factory
+
+        @type shell: C{ManagementShell}
+        @param shell: the command shell
+        """
+        pass
+
+    def on_exit(shell):
+        """
+        Called when the shell is closed normaly.
+        This may not be called when the shell is terminated.
+
+        @type shell: C{ManagementShell}
+        @param shell: the command shell
+        """
+        pass
+
+    def on_cleanup(factory, shell):
+        """
+        Called when the cleanup command executes.
+
+        @type factory: C{ServerFactory}
+        @param factory: the server factory
+
+        @type shell: C{ManagementShell}
+        @param shell: the command shell
+        """
+        pass
+
+    def run(shell, clients, line):
+        """
+        Runs the command.
+
+        @type shell: C{ManagementShell}
+        @param shell: the command shell
+
+        @type clients: C{List} of C{ServerProtocol}
+        @param clients: list of the currently selected clients
+
+        @type line: C{str} or C{unicode}
+        @param line: the arguments of the command (excluding ICommand.command)
+
+        @rtype: C{bool}
+        @return: whether to quit the shell or not.
+        """
+        pass
+
+
+class IClientPlugin(Interface):
+    """A client-side plugin."""
+
+    plugin_id = Attribute("""
+    @type plugin_id: C{str} or C{unicode}
+    @param plugin_id: the string used to identify this plugin.
+    """)
+
+    def on_load(protocol):
+        """
+        Called after the plugin was loaded.
+
+        @type protocol: C{ClientProtocol}
+        @param protocol: The client-side protocol.
+        """
+        pass
+
+    def on_unload(protocol):
+        """
+        Called before the plugin will be unloaded.
+
+        @type protocol: C{ClientProtocol}
+        @param protocol: The client-side protocol.
+        """
+        pass
+
+    def on_disconnect(protocol):
+        """
+        Called when the connection was lost.
+
+        @type protocol: C{ClientProtocol}
+        @param protocol: The client-side protocol.
+        """
+        pass
+
+    def on_connect(protocol):
+        """
+        Called when the connection was established.
+        This may not be called on the first connect, as the plugin may not have been loaded at this time.
+
+        @type protocol: C{ClientProtocol}
+        @param protocol: The client-side protocol.
+        """
+        pass
+
+    def on_cleanup(protocol):
+        """
+        Called when the cleanup command was received.
+
+        @type protocol: C{ClientProtocol}
+        @param protocol: The client-side protocol.
+        """
+        pass
+
+    def on_remotecall(protocol, *args, **kwargs):
+        """
+        Called when a remotcall is being made to this plugin.
+
+        @type protocol: C{ClientProtocol}
+        @param protocol: The client-side protocol.
+        """
+        pass
 
 
 # ================= PROTOCOLS ======================
@@ -333,21 +522,15 @@ class DualRPCProtocol(IntNStringReceiver):
 
 class ServerAndClientSharedProtocol(DualRPCProtocol):
     """The part of the protocol shared by both the server and the client."""
-    DATA_DIR = TEMP_DIR
-    WORK_DIR = os.path.join(DATA_DIR, "workspace")  # path of temporary CWD
-    SYNC_DIR = os.path.join(DATA_DIR, "sync")  # path of the directory where files for the syncinc are kept.
     MAX_SINGLE_TRANSFER = 2 ** 15
 
     def make_temp_dirs(self):
         """create the tempdirs if they do not exists yet."""
-        paths = [self.DATA_DIR, self.WORK_DIR, self.SYNC_DIR]
-        for p in paths:
-            if not os.path.exists(p):
-                os.makedirs(p)
+        make_global_dirs()
 
     def is_path_allowed(self, p):
         """returns True if the path p is allowed to be accessed, False otherwise."""
-        lap = os.path.abspath(self.DATA_DIR)
+        lap = os.path.abspath(DATA_DIR)
         ap = os.path.abspath(os.path.join(lap, p))
         return ap.startswith(lap)
 
@@ -368,7 +551,7 @@ class ServerAndClientSharedProtocol(DualRPCProtocol):
         if os.path.isabs(name):
             p = name
         else:
-            p = os.path.join(self.DATA_DIR, name)
+            p = os.path.join(DATA_DIR, name)
         if not self.is_path_allowed(p):
             raise IOError("Path not allowed!")
         content = self._decode(content)
@@ -380,7 +563,7 @@ class ServerAndClientSharedProtocol(DualRPCProtocol):
         if os.path.isabs(name):
             p = name
         else:
-            p = os.path.join(self.DATA_DIR, name)
+            p = os.path.join(DATA_DIR, name)
         if not self.is_path_allowed(p):
             raise IOError("Path not allowed!")
         content = self._decode(content)
@@ -414,9 +597,10 @@ class ServerAndClientSharedProtocol(DualRPCProtocol):
     def remote_get_paths(self):
         """returns a dict containing the temp dir specifications of this client."""
         p = {
-            "data": self.DATA_DIR,
-            "sync": self.SYNC_DIR,
-            "work": self.WORK_DIR,
+            "data": DATA_DIR,
+            "sync": SYNC_DIR,
+            "work": WORK_DIR,
+            "plugins": PLUGIN_DIR,
             "cwd": os.getcwd(),
             }
         return p
@@ -491,7 +675,7 @@ class ServerProtocol(ServerAndClientSharedProtocol):
         """sends the directory inp to outp on the client."""
         paths = yield self.get_paths()
         osp = paths["sync"]
-        tzp = os.path.join(self.SYNC_DIR, random_filename())
+        tzp = os.path.join(SYNC_DIR, random_filename())
         top = os.path.join(osp, random_filename())
         zip_dir(inp, tzp)
         with open(tzp, "rb") as f:
@@ -518,10 +702,29 @@ class ServerProtocol(ServerAndClientSharedProtocol):
         yield self.cd(cwd)
         defer.returnValue(ret)
 
+    @defer.inlineCallbacks
+    def send_plugins(self, inp):
+        """sends the plugins installed in 'inp' to the client."""
+        paths = yield self.get_paths()
+        pp = paths["plugins"]
+        yield self.send_dir(inp, pp)
+
     def stop(self):
         """stops the client."""
         self.factory.remove_client(self)
         return self.call_remote("stop")
+
+    def load_plugins(self):
+        """tells the client to load its plugins."""
+        return self.call_remote("load_plugins")
+
+    def unload_plugins(self):
+        """tells the client to load its plugins."""
+        return self.call_remote("unload_plugins")
+
+    def call_plugin(self, pid, *args, **kwargs):
+        """calls the plugin and returns a deferred which will fire with the return value."""
+        return self.call_remote("call_plugin", pid, *args, **kwargs)
 
 
 class ClientProtocol(ServerAndClientSharedProtocol):
@@ -534,7 +737,31 @@ class ClientProtocol(ServerAndClientSharedProtocol):
         self.is_working = False
         self.stopped = False
         self.tags = {}
+        self.plugins = {}
         self.make_temp_dirs()
+
+    def load_plugins(self):
+        """loads the plugins."""
+        self.plugins = {plugin.plugin_id: plugin for plugin in load_plugins(IClientPlugin)}
+        self.call_plugins("on_load", self)
+
+    remote_load_plugins = load_plugins  # alias for rpc
+
+    def unload_plugins(self):
+        """resets the loaded plugins and unregisters them."""
+        self.call_plugins("on_unload", self)
+        self.plugins = {}
+
+    remote_unload_plugins = unload_plugins  # alias for rpc
+
+    def call_plugins(self, fname, *args, **kwargs):
+        """calls plugin.fname(*args, **kwargs) on all plugins"""
+        for plugin_id in self.plugins:
+            plugin = self.plugins[plugin_id]
+            if hasattr(plugin, fname):
+                f = getattr(plugin, fname)
+                f(*args, **kwargs)
+
 
     def set_working(self, status=True):
         """sets the working status of the client."""
@@ -545,10 +772,12 @@ class ClientProtocol(ServerAndClientSharedProtocol):
         ServerAndClientSharedProtocol.connectionMade(self)
         self.set_working(False)
         self.make_temp_dirs()
+        self.call_plugins("on_connect", self)
 
     def connectionLost(self, reason):
         """called when the connection was lost."""
         ServerAndClientSharedProtocol.connectionLost(self, reason)
+        self.call_plugins("on_disconnect", self)
         if (not self.ns.reconnect) and (not self.stopped):
             if isinstance(reason.value, ConnectionDone):
                 self.d.callback(None)
@@ -609,14 +838,15 @@ class ClientProtocol(ServerAndClientSharedProtocol):
 
     def remote_clear_data_dir(self):
         """clears the data dir."""
-        delete_dir_content(self.DATA_DIR)
+        delete_dir_content(DATA_DIR)
+        self.call_plugins("on_cleanup", self)
         self.make_temp_dirs()
 
     def remote_cd(self, fn=None):
         """sets the working directory."""
         self.make_temp_dirs()
         if fn is None:
-            fn = self.WORK_DIR
+            fn = WORK_DIR
         os.chdir(fn)
 
     def remote_getcwd(self):
@@ -636,6 +866,13 @@ class ClientProtocol(ServerAndClientSharedProtocol):
         self.disconnect()
         self.stopped = True
         self.d.callback(None)
+
+    def remote_call_plugin(self, pid, *args, **kwargs):
+        """calls a plugin."""
+        if pid not in self.plugins:
+            raise PluginNotFoundError("Plugin '{n}' not found!".format(n=pid))
+        plugin = self.plugins[pid]
+        return plugin.on_remotecall(self, *args, **kwargs)
 
 
 class ServerFactory(protocol.Factory):
@@ -752,13 +989,31 @@ class ClientFactory(protocol.Factory):
 
 class ManagementShell(cmd.Cmd):
     """The management shell."""
-    intro = "{n} v{v}".format(n=NAME, v=VERSION)
+    intro = "{n} v{v}\nType 'help' for help.".format(n=NAME, v=VERSION)
 
     def __init__(self, factory):
         cmd.Cmd.__init__(self)
         self.factory = factory
+        self.plugins = []
         self.selected = []
         self.prompt = "(0 selected)"
+
+    def load_plugins(self):
+        """loads the plugins."""
+        self.plugins = list(load_plugins(ICommand))
+        self.call_plugins("on_load", self.factory, self)
+
+    def unload_plugins(self):
+        """resets the loaded plugins and unregisters them."""
+        self.call_plugins("on_unload", self.factory, self)
+        self.plugins = []
+
+    def call_plugins(self, fname, *args, **kwargs):
+        """calls plugin.fname(*args, **kwargs) on all plugins"""
+        for plugin in self.plugins:
+            if hasattr(plugin, fname):
+                f = getattr(plugin, fname)
+                f(*args, **kwargs)
 
     def write(self, msg):
         """writes a message."""
@@ -801,7 +1056,24 @@ class ManagementShell(cmd.Cmd):
         """called when a command finished."""
         self.filter_selected()
         self.update_prompt()
+        if stop:
+            self.call_plugins("on_exit", self)
         return stop
+
+    def default(self, line):
+        """handles a line for which no do_* method exists."""
+        splitted = shlex.split(line)
+        command = splitted[0]
+        arguments = splitted[1:]
+        clients = [self.factory.get_client(cid) for cid in self.selected]
+        f = False
+        for plugin in self.plugins:
+            if plugin.command == command:
+                f = True
+                plugin.run(self, clients, arguments)
+                break
+        if not f:
+            return cmd.Cmd.default(self, line)
 
     def do_EOF(self, l):
         """EOF|quit|exit|q: exits the shell and stops the server."""
@@ -1014,6 +1286,7 @@ class ManagementShell(cmd.Cmd):
     @defer.inlineCallbacks
     def do_clear_data(self, l):
         """clear_data: removes all temporary files on the selected clients."""
+        self.call_plugins("on_cleanup", self.factory, self)
         ds = []
         clients = self.factory.get_clients(self.selected, include_None=False)
         for c in clients:
@@ -1024,6 +1297,8 @@ class ManagementShell(cmd.Cmd):
             self.write("Done\n")
         else:
             self.write("Error: No clients found.\n")
+
+    do_cleanup = do_clear_data
 
     @command_on_reactor_loop
     @defer.inlineCallbacks
@@ -1054,6 +1329,59 @@ class ManagementShell(cmd.Cmd):
     def do_deploy_per_core(self, l):
         """deploy <dir> <command> [args [args...]]: send dir to selected clients and run command n times parallel in the directory on the client, where n is the number of cpu_cores of the client."""
         return self.do_deploy(l, per_core=True)
+
+    @command_on_reactor_loop
+    @defer.inlineCallbacks
+    def do_load_plugins(self, l):
+        """load_plugins: loads the plugins."""
+        self.load_plugins()
+        ds = []
+        for cid in self.selected:
+            client = self.factory.get_client(cid)
+            d = client.load_plugins()
+            ds.append(d)
+        yield defer.gatherResults(ds)
+
+    @command_on_reactor_loop
+    @defer.inlineCallbacks
+    def do_unload_plugins(self, l):
+        """unload_plugins: unloads the plugins."""
+        self.unload_plugins()
+        ds = []
+        for cid in self.selected:
+            client = self.factory.get_client(cid)
+            d = client.unload_plugins()
+            ds.append(d)
+        yield defer.gatherResults(ds)
+
+    def do_reload_plugins(self, l):
+        """reload_plugins: reloads the plugins."""
+        self.do_unload_plugins(l)
+        self.do_send_plugins(l)
+        self.do_load_plugins(l)
+
+    def do_plugins(self, l):
+        """plugins: shows the currently loaded plugins for the shell."""
+        self.pprint(self.plugins)
+
+    @command_on_reactor_loop
+    @defer.inlineCallbacks
+    def do_send_plugins(self, l):
+        """sends the plugins to the selected clients."""
+        clients = self.factory.get_clients(self.selected, include_None=False)
+        ds = []
+        for c in clients:
+            d = c.send_plugins(HOME_PLUGIN_DIR)
+            ds.append(d)
+        if len(ds) > 0:
+            yield defer.gatherResults(ds)
+            self.write("Done.\n")
+        else:
+            self.write("Error: No clients found; no plugins sent.\n")
+
+    def do_local_pyexec(self, l):
+        """local_pyexec <cmd>: exec cmd on this shell."""
+        exec(l)
 
 
 
