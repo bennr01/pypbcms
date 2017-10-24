@@ -36,7 +36,7 @@ from zope.interface import Interface, Attribute
 # ================= CONSTANTS ======================
 
 NAME = "pypbcms"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 DEFAULT_PORT = 6925
 
@@ -1048,6 +1048,7 @@ class ManagementShell(cmd.Cmd):
 
     def precmd(self, line):
         """called before a command executes."""
+        make_global_dirs()
         self.filter_selected()
         self.update_prompt()
         return line
@@ -1419,8 +1420,7 @@ def main():
     The main function.
     We start the server and a shell in a thread and wait for its completion.
     """
-    if not os.path.exists(TEMP_DIR):
-        os.mkdir(TEMP_DIR)
+    make_global_dirs()
 
     parser = argparse.ArgumentParser(description="A python plugin-based cluster management system")
     parser.add_argument("action", action="store", choices=["server", "client"], help="what to do")
