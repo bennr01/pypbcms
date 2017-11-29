@@ -6,7 +6,7 @@ from setuptools import setup
 setup(
     # TODO: the following values are defined in two places at once. This should be fixed.
     name="pypbcms",
-    version="1.1.0",
+    version="1.1.1",
     author="bennr01",
     author_email="benjamin99.vogt@web.de",
     description="A plugin based cluster management system written in python",

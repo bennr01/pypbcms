@@ -36,7 +36,7 @@ from zope.interface import Interface, Attribute
 # ================= CONSTANTS ======================
 
 NAME = "pypbcms"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 DEFAULT_PORT = 6925
 
@@ -45,6 +45,8 @@ LENGTH_PREFIX_LENGTH = struct.calcsize(LENGTH_PREFIX_FORMAT)
 MAX_MESSAGE_LENGTH = struct.unpack(LENGTH_PREFIX_FORMAT, "\xff" * LENGTH_PREFIX_LENGTH)[0]
 
 _STOP = 1
+_CONTINUE = 2
+_CONNECTION_LOST = 3
 
 TEMP_DIR = os.path.join(tempfile.gettempdir(), NAME)  # path of the temporary directory
 HOME_DATA_DIR = os.path.join(os.path.expanduser("~"), NAME)
@@ -467,7 +469,7 @@ class DualRPCProtocol(IntNStringReceiver):
         try:
             content = json.loads(s)
         except Exception:
-            self.loseConnection()
+            self.transport.loseConnection()
             defer.returnValue(None)
         
         mtype = content.get("type", None)
@@ -482,7 +484,7 @@ class DualRPCProtocol(IntNStringReceiver):
                     }
                 )
             if not match:
-                self.loseConnection()
+                self.transport.loseConnection()
                 self._did_version_check = False  # set to false to ignore incomming messages
             else:
                 self._did_version_check = True
@@ -490,7 +492,7 @@ class DualRPCProtocol(IntNStringReceiver):
         elif mtype == self._TYPE_VERSION_RESPONSE:
             m = content.get("match", False)
             if not m:
-                self.loseConnection()
+                self.transport.loseConnection()
                 self._did_version_check = False
             else:
                 self._did_version_check = True
@@ -502,7 +504,7 @@ class DualRPCProtocol(IntNStringReceiver):
         elif mtype in (self._TYPE_RPC_REQUEST, self._TYPE_RPC_RESPONSE):
             cid = content.get("id", None)
             if cid is None:
-                self.loseConnection()
+                self.transport.loseConnection()
                 defer.returnValue(None)
             if mtype == self._TYPE_RPC_REQUEST:
                 fn = content.get("name", None)
@@ -557,7 +559,7 @@ class DualRPCProtocol(IntNStringReceiver):
                     d.callback(res)
         else:
             # protocol violation
-            self.loseConnection()
+            self.transport.loseConnection()
 
     def send_message(self, msg):
         """encodes the message as json and sends it to the peer."""
@@ -842,9 +844,9 @@ class ClientProtocol(ServerAndClientSharedProtocol):
         """called when the connection was lost."""
         ServerAndClientSharedProtocol.connectionLost(self, reason)
         self.call_plugins("on_disconnect", self)
-        if (not self.ns.reconnect) and (not self.stopped):
+        if ((not self.ns.reconnect) or self.ns.autoconnect) and (not self.stopped):
             if isinstance(reason.value, ConnectionDone):
-                self.d.callback(None)
+                self.d.callback(_CONNECTION_LOST)
             else:
                 self.d.errback(reason)
 
@@ -1482,7 +1484,7 @@ def start_shell(reactor, ns):
 def start_client(reactor, ns):
     """starts the client and connects to the server."""
     connected = False
-    while ((ns.autoconnect and ns.reconnect) or (not connected)):
+    while (ns.reconnect or (not connected)):
         connected = True
         if ns.autoconnect:
             host, port = yield get_autoconnect_addr(reactor)
@@ -1491,12 +1493,16 @@ def start_client(reactor, ns):
         d = defer.Deferred()
         factory = ClientFactory(ns, d)
         ep = endpoints.TCP4ClientEndpoint(reactor, host=host, port=port)
-        cs = ClientService(ep, factory, retryPolicy=lambda f: 3)
-        factory.service = cs
-        if not ns.reconnect:
-            wfc = cs.whenConnected(failAfterFailures=1)
-            wfc.addErrback(d.errback)
-        cs.startService()
+        if not ns.autoconnect:
+            cs = ClientService(ep, factory, retryPolicy=lambda f: 3)
+            factory.service = cs
+            if not ns.reconnect:
+                wfc = cs.whenConnected(failAfterFailures=1)
+                wfc.addErrback(d.errback)
+            cs.startService()
+        else:
+            factory.service = None
+            ep.connect(factory)
         state = yield d
         if state == _STOP:
             break
@@ -1516,7 +1522,7 @@ def main():
     parser.add_argument("-p", "--port", action="store", type=int, default=DEFAULT_PORT, help="port of the server")
     parser.add_argument("-r", "--reconnect", action="store_true", dest="reconnect", help="auto reconnect to server")
     parser.add_argument("-b", "--broadcast", action="store_true", dest="broadcast", help="broadcast the ip/port of this server")
-    parser.add_argument("-i", "--interval", action="store", dest="broadcast_interval", type=lambda x: max(int(x), 0.001), help="interval to broadcast address")
+    parser.add_argument("-i", "--interval", action="store", dest="broadcast_interval", type=lambda x: max(int(x), 0.01), help="interval to broadcast address", default=3)
     parser.add_argument("-a", "--autoconnect", action="store_true", dest="autoconnect", help="autoconnect to broadcasted ip/ports")
     parser.add_argument("--noshell", action="store_false", dest="shell", help="do not start a shell when starting the server")
     ns = parser.parse_args()
