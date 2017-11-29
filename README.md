@@ -12,6 +12,7 @@ A plugin based cluster management system written in python.
   - run a command on each node or each core
   - transfer a directorie and execute a command on each node or each core
 - client auto-reconnect (option `-r`)
+- auto-detection of server/master/primary node (options `-b`, `-i` and `-a`)
 - single file (excluding optional plugins)
 - Command-Shell
 - pure python / no C-dependencies
@@ -44,8 +45,10 @@ The server
  - does not need to be the same master/primary node other programs use as their master/primary node. It does not tell your program which master node it should use.
  - is the node from which the plugins will be synced
  - does not automatically launch a client on the same node.
+ - can broadcast its ip/port using UDP (option `-b`)
  The clients:
  - are the nodes on which commands will be run
  - do not offer a user interface
+ - can automatically connect to the server (option `-a`)
  
  
