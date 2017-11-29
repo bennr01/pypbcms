@@ -36,13 +36,15 @@ from zope.interface import Interface, Attribute
 # ================= CONSTANTS ======================
 
 NAME = "pypbcms"
-VERSION = "1.0.2"
+VERSION = "1.1.0"
 
 DEFAULT_PORT = 6925
 
 LENGTH_PREFIX_FORMAT = "!Q"
 LENGTH_PREFIX_LENGTH = struct.calcsize(LENGTH_PREFIX_FORMAT)
 MAX_MESSAGE_LENGTH = struct.unpack(LENGTH_PREFIX_FORMAT, "\xff" * LENGTH_PREFIX_LENGTH)[0]
+
+_STOP = 1
 
 TEMP_DIR = os.path.join(tempfile.gettempdir(), NAME)  # path of the temporary directory
 HOME_DATA_DIR = os.path.join(os.path.expanduser("~"), NAME)
@@ -54,6 +56,8 @@ PLUGIN_DIR = os.path.join(TEMP_DIR, "plugins")
 PATHS = [TEMP_DIR, HOME_DATA_DIR, HOME_PLUGIN_DIR, DATA_DIR, WORK_DIR, SYNC_DIR, PLUGIN_DIR]
 PLUGIN_PATHS = [PLUGIN_DIR, HOME_PLUGIN_DIR]
 
+MAGIC = "{name}/{version}".format(name=NAME, version=VERSION)  # magic to identify broadcast messages
+BROADCAST_PORT = 6924
 
 
 # ================= EXCEPTIONS ======================
@@ -340,6 +344,66 @@ class IClientPlugin(Interface):
         @param protocol: The client-side protocol.
         """
         pass
+
+
+# ================= AUTOCONNECT ======================
+
+
+class AddressBroadcastProtocol(protocol.DatagramProtocol):
+    """A protocol for broadcasting the port and ip of this host."""
+    noisy = False
+
+    def __init__(self):
+        self._port = None
+        self._ds = []
+        self._loop = None
+
+    def startProtocol(self):
+        self.transport.setBroadcastAllowed(True)
+
+    def start_broadcasting(self, port, interval=3):
+        """starts broadcasting the ip/port"""
+        if self._loop is not None:
+            raise RuntimeError("Already broadcasting!")
+        self._loop = task.LoopingCall(self.send_addrinfo, port)
+        self._loop.start(interval=interval, now=True)
+
+    def stop_broadcasting(self):
+        """stops the broadcasting of the ip/port"""
+        self._loop.stop()
+        self._loop = None
+
+    def send_addrinfo(self, port):
+        """sends the address information."""
+        self.transport.write(MAGIC + str(port), ("<broadcast>", BROADCAST_PORT))
+
+    def datagramReceived(self, datagram, addr):
+        if datagram.startswith(MAGIC):
+            portinfo = datagram[len(MAGIC):]
+            try:
+                port = int(portinfo)
+            except ValueError:
+                return
+            target = (addr[0], port)
+            for d in self._ds:
+                d.callback(target)
+            self._ds = []
+
+    def wait_for_addrinfo(self):
+        """returns a deferred which will fire with a received (host, port)."""
+        d = defer.Deferred()
+        self._ds.append(d)
+        return d
+
+
+@defer.inlineCallbacks
+def get_autoconnect_addr(reactor):
+    """returns a deferred which will fire with a received (host, port)."""
+    p = AddressBroadcastProtocol()
+    port = reactor.listenUDP(BROADCAST_PORT, p)
+    addr = yield p.wait_for_addrinfo()
+    yield port.stopListening()
+    defer.returnValue(addr)
 
 
 # ================= PROTOCOLS ======================
@@ -865,7 +929,7 @@ class ClientProtocol(ServerAndClientSharedProtocol):
         self.factory.stop()
         self.disconnect()
         self.stopped = True
-        self.d.callback(None)
+        self.d.callback(_STOP)
 
     def remote_call_plugin(self, pid, *args, **kwargs):
         """calls a plugin."""
@@ -1388,31 +1452,54 @@ class ManagementShell(cmd.Cmd):
 
 # ================= MAIN CODE ======================
 
+@defer.inlineCallbacks
 def start_shell(reactor, ns):
     """launches a shell and returns a deferred, which will be fired when the shell is closed."""
     factory = ServerFactory()
     ep = endpoints.TCP4ServerEndpoint(reactor, interface="0.0.0.0", port=ns.port)
     ep.listen(factory)
+
+    if ns.broadcast:
+        broadcaster = AddressBroadcastProtocol()
+        reactor.listenUDP(BROADCAST_PORT, broadcaster)
+        broadcaster.start_broadcasting(port=ns.port, interval=ns.broadcast_interval)
+    else:
+        broadcaster = None
+    
     if ns.shell:
         shell = ManagementShell(factory)
         d = threads.deferToThread(shell.cmdloop)
-        return d
-    else:
-        d = defer.Deferred()
-        return d
+        yield d
 
+    else:
+        yield defer.Deferred()  # block forever
+
+    if broadcaster is not None:
+        broadcaster.stop_broadcasting()
+
+
+@defer.inlineCallbacks
 def start_client(reactor, ns):
     """starts the client and connects to the server."""
-    d = defer.Deferred()
-    factory = ClientFactory(ns, d)
-    ep = endpoints.TCP4ClientEndpoint(reactor, host=ns.host, port=ns.port)
-    cs = ClientService(ep, factory, retryPolicy=lambda f: 3)
-    factory.service = cs
-    if not ns.reconnect:
-        wfc = cs.whenConnected(failAfterFailures=1)
-        wfc.addErrback(d.errback)
-    cs.startService()
-    return d
+    connected = False
+    while ((ns.autoconnect and ns.reconnect) or (not connected)):
+        connected = True
+        if ns.autoconnect:
+            host, port = yield get_autoconnect_addr(reactor)
+        else:
+            host, port = ns.host, ns.port
+        d = defer.Deferred()
+        factory = ClientFactory(ns, d)
+        ep = endpoints.TCP4ClientEndpoint(reactor, host=host, port=port)
+        cs = ClientService(ep, factory, retryPolicy=lambda f: 3)
+        factory.service = cs
+        if not ns.reconnect:
+            wfc = cs.whenConnected(failAfterFailures=1)
+            wfc.addErrback(d.errback)
+        cs.startService()
+        state = yield d
+        if state == _STOP:
+            break
 
 
 def main():
@@ -1428,6 +1515,9 @@ def main():
     parser.add_argument("-H", "--host", action="store", help="host/interface to connect/bind to", default="0.0.0.0")
     parser.add_argument("-p", "--port", action="store", type=int, default=DEFAULT_PORT, help="port of the server")
     parser.add_argument("-r", "--reconnect", action="store_true", dest="reconnect", help="auto reconnect to server")
+    parser.add_argument("-b", "--broadcast", action="store_true", dest="broadcast", help="broadcast the ip/port of this server")
+    parser.add_argument("-i", "--interval", action="store", dest="broadcast_interval", type=lambda x: max(int(x), 0.001), help="interval to broadcast address")
+    parser.add_argument("-a", "--autoconnect", action="store_true", dest="autoconnect", help="autoconnect to broadcasted ip/ports")
     parser.add_argument("--noshell", action="store_false", dest="shell", help="do not start a shell when starting the server")
     ns = parser.parse_args()
     if ns.verbose:
